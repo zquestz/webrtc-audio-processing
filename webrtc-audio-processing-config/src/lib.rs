@@ -31,6 +31,9 @@ pub struct Config {
     /// Enables and configures background noise suppression. Force-enables high pass filtering.
     pub noise_suppression: Option<NoiseSuppression>,
 
+    /// Enables transient suppression (keyboard clicks, mouse clicks, and other sudden noises).
+    pub transient_suppression: bool,
+
     /// Enables and configures automatic gain control (v1 or v2).
     pub gain_controller: Option<GainController>,
 }

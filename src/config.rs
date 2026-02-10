@@ -30,9 +30,9 @@ impl FromConfig<Config> for ffi::AudioProcessing_Config {
             None => (None, None),
         };
 
-        // Transient suppressor is being deprecated.
-        let transient_suppression =
-            ffi::AudioProcessing_Config_TransientSuppression { enabled: false };
+        let transient_suppression = ffi::AudioProcessing_Config_TransientSuppression {
+            enabled: other.transient_suppression,
+        };
 
         let (gain_controller1, gain_controller2) = match other.gain_controller {
             Some(GainController::GainController1(v1)) => (Some(v1), None),

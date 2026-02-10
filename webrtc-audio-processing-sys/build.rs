@@ -75,7 +75,7 @@ fn prefix_archive_symbols(
 mod webrtc {
     use super::*;
 
-    pub(super) fn get_build_paths() -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    pub(super) fn get_build_paths() -> Result<(Vec<PathBuf>, Vec<PathBuf>, bool)> {
         let (pkgconfig_include_path, pkgconfig_lib_path) = find_pkgconfig_paths()?;
 
         let include_path = std::env::var("WEBRTC_AUDIO_PROCESSING_INCLUDE")
@@ -94,7 +94,7 @@ mod webrtc {
             );
         }
 
-        Ok((vec![include_path.unwrap()], vec![lib_path.unwrap()]))
+        Ok((vec![include_path.unwrap()], vec![lib_path.unwrap()], false))
     }
 
     pub(super) fn build_if_necessary() -> Result<()> {
@@ -140,7 +140,8 @@ mod webrtc {
 
     const BUNDLED_SOURCE_PATH: &str = "./webrtc-audio-processing";
 
-    pub(super) fn get_build_paths() -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    /// Returns (include_paths, lib_paths, has_system_abseil).
+    pub(super) fn get_build_paths() -> Result<(Vec<PathBuf>, Vec<PathBuf>, bool)> {
         let mut include_paths = vec![
             out_dir().join("include"),
             out_dir().join("include").join(LIB_NAME),
@@ -152,20 +153,28 @@ mod webrtc {
         let mut lib_paths = vec![
             // MacOS, Arch Linux, baseline default
             out_dir().join("lib"),
-            // Ubuntu Linux (our CI)
-            out_dir().join("lib").join("x86_64-linux-gnu"),
-            // Ubuntu Linux (Arm 64bit)
-            out_dir().join("lib").join("aarch64-linux-gnu"),
             // Gentoo Linux (x86_64 multilib)
             out_dir().join("lib64"),
         ];
 
+        // Debian/Ubuntu multiarch path derived from target triple.
+        // e.g., "x86_64-unknown-linux-gnu" → "lib/x86_64-linux-gnu"
+        //        "aarch64-unknown-linux-gnu" → "lib/aarch64-linux-gnu"
+        if let Ok(target) = std::env::var("TARGET") {
+            let parts: Vec<&str> = target.split('-').collect();
+            if parts.len() >= 3 {
+                let arch = parts[0];
+                let os_abi = parts[parts.len() - 2..].join("-");
+                lib_paths.push(out_dir().join("lib").join(format!("{arch}-{os_abi}")));
+            }
+        }
+
         // Notes: c8896801 added support for 20250814, but the meson.build is still expecting
         // >=20240722 and the subproject will fetch 20240722. If the build environment has 20250814
         // installed, it should still pick it up and build successfully, though.
-        if let Ok(mut lib) =
-            pkg_config::Config::new().atleast_version("20240722").probe("absl_base")
-        {
+        let mut has_system_abseil =
+            pkg_config::Config::new().atleast_version("20240722").probe("absl_base").ok();
+        if let Some(ref mut lib) = has_system_abseil {
             // If abseil package is installed locally, meson would have linked it for
             // webrtc-audio-processing-2. Use the same library for our wrapper, too.
             include_paths.append(&mut lib.include_paths);
@@ -177,7 +186,7 @@ mod webrtc {
             lib_paths.push(webrtc_build_dir().join("subprojects").join("abseil-cpp-20240722.0"));
         }
 
-        Ok((include_paths, lib_paths))
+        Ok((include_paths, lib_paths, has_system_abseil.is_some()))
     }
 
     pub(super) fn build_if_necessary() -> Result<()> {
@@ -198,24 +207,93 @@ mod webrtc {
         );
 
         // Copy the sources to under out directory so that we can patch it without consequences.
-        let mut cp = Command::new("cp");
-        // Copy recursively, preserve attributes. Use trailing dot trick to prevent creating
-        // `webrtc-audio-processing/webrtc-audio-processing` nesting on a 2nd invocation.
-        cp.arg("-a").arg(bundled_source_path.join(".")).arg(&webrtc_source_dir);
-        let status = cp.status().context("executing cp")?;
-        assert!(status.success(), "Command failed: {:?}", &cp);
+        // A Rust copy rather than `cp -a`: Windows has no `cp`, and cargo's git checkout embeds
+        // a real `.git` directory in the submodule whose read-only pack files make re-copies
+        // into a cached OUT_DIR fail.
+        copy_dir_recursive(bundled_source_path, &webrtc_source_dir)?;
 
         #[cfg(feature = "experimental-unlink-ns")]
         apply_patch("unlink-multichannel-noise-suppression-filters.patch")?;
 
+        patch_denormal_disabler(&webrtc_source_dir)?;
+
         let mut meson = Command::new("meson");
         meson.arg("setup").arg("--prefix").arg(out_dir().as_os_str());
-        meson.arg("--reconfigure");
+
+        // Only use --reconfigure if a prior build exists (has meson-private dir).
+        // On fresh builds (e.g., CI without cache), --reconfigure fails because
+        // there's no existing configuration to reconfigure.
+        if webrtc_build_dir.join("meson-private").exists() {
+            meson.arg("--reconfigure");
+        }
 
         if cfg!(target_os = "macos") {
-            let link_args = "['-framework', 'CoreFoundation', '-framework', 'Foundation']";
-            meson.arg(format!("-Dc_link_args={}", link_args));
-            meson.arg(format!("-Dcpp_link_args={}", link_args));
+            let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+            let host_arch = std::env::consts::ARCH;
+            let is_cross = target_arch != host_arch;
+
+            let mut link_args = vec![
+                "'-framework', 'CoreFoundation'".to_string(),
+                "'-framework', 'Foundation'".to_string(),
+            ];
+
+            if is_cross {
+                let arch_arg = format!("'-arch', '{target_arch}'");
+                meson.arg(format!("-Dc_args=[{arch_arg}]"));
+                meson.arg(format!("-Dcpp_args=[{arch_arg}]"));
+                link_args.push(arch_arg);
+
+                let cross_file = out_dir().join("meson-cross.ini");
+                std::fs::write(
+                    &cross_file,
+                    format!(
+                        "\
+[binaries]
+c = 'clang'
+cpp = 'clang++'
+ar = 'ar'
+strip = 'strip'
+
+[host_machine]
+system = 'darwin'
+cpu_family = '{target_arch}'
+cpu = '{target_arch}'
+endian = 'little'
+"
+                    ),
+                )?;
+                meson.arg("--cross-file");
+                meson.arg(cross_file.to_str().unwrap());
+            }
+
+            let link_args_str = link_args.join(", ");
+            meson.arg(format!("-Dc_link_args=[{link_args_str}]"));
+            meson.arg(format!("-Dcpp_link_args=[{link_args_str}]"));
+        }
+
+        if cfg!(target_os = "windows") {
+            // Activate Visual Studio environment so meson finds MSVC (cl.exe, link.exe)
+            meson.arg("--vsenv");
+
+            // Write MSVC native file with required defines for abseil/WebRTC headers
+            let native_file = out_dir().join("msvc-native.ini");
+            std::fs::write(
+                &native_file,
+                "\
+[binaries]
+c = 'cl'
+cpp = 'cl'
+ar = 'lib'
+
+[built-in options]
+cpp_std = 'c++20'
+cpp_eh = 'sc'
+c_args = ['-DWIN32_LEAN_AND_MEAN', '-DNOMINMAX']
+cpp_args = ['-DWIN32_LEAN_AND_MEAN', '-DNOMINMAX']
+",
+            )?;
+            meson.arg("--native-file");
+            meson.arg(native_file.to_str().unwrap());
         }
 
         let status = meson
@@ -226,19 +304,20 @@ mod webrtc {
             .context("Failed to execute meson. Do you have it installed?")?;
         assert!(status.success(), "Command failed: {:?}", &meson);
 
-        let mut ninja = Command::new("ninja");
-        let status = ninja
-            .current_dir(&webrtc_build_dir)
+        let mut compile = Command::new("meson");
+        let status = compile
+            .args(["compile", "-C"])
+            .arg(webrtc_build_dir.to_str().unwrap())
             .status()
-            .context("Failed to execute ninja. Do you have it installed?")?;
-        assert!(status.success(), "Command failed: {:?}", &ninja);
+            .context("Failed to execute meson compile")?;
+        assert!(status.success(), "Command failed: {:?}", &compile);
 
-        let mut install = Command::new("ninja");
+        let mut install = Command::new("meson");
         let status = install
-            .current_dir(&webrtc_build_dir)
-            .arg("install")
+            .args(["install", "-C"])
+            .arg(webrtc_build_dir.to_str().unwrap())
             .status()
-            .context("Failed to execute ninja install")?;
+            .context("Failed to execute meson install")?;
         assert!(status.success(), "Command failed: {:?}", &install);
 
         Ok(())
@@ -268,6 +347,12 @@ mod webrtc {
         lib_dirs: &[PathBuf],
         prefix: &str,
     ) -> Result<Vec<String>> {
+        if cfg!(target_os = "windows") {
+            // Symbol prefixing via nm/objcopy is not available on MSVC.
+            // Not needed when only one version of the library is linked.
+            return Ok(vec![]);
+        }
+
         let static_lib_filename = format!("lib{LIB_NAME}.a");
 
         for lib_dir in lib_dirs {
@@ -282,11 +367,97 @@ mod webrtc {
         bail!("Cannot find {static_lib_filename} in {lib_dirs:?} to prefix its symbols.");
     }
 
+    /// Recursive source-tree copy used on all platforms (Windows has no
+    /// `cp`). Skips `.git` — the build doesn't need repo metadata, and its
+    /// read-only pack files can't be overwritten when re-copying into a
+    /// cached OUT_DIR — and files whose destination already exists with
+    /// the same size and a newer-or-equal mtime, so unchanged sources keep
+    /// their old timestamps and ninja can stay incremental across build
+    /// script reruns.
+    fn copy_dir_recursive(from: &Path, to: &Path) -> Result<()> {
+        std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
+        for entry in from.read_dir().with_context(|| format!("reading {}", from.display()))? {
+            let entry = entry?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let src = entry.path();
+            let dst = to.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_dir_recursive(&src, &dst)?;
+            } else {
+                if let (Ok(src_meta), Ok(dst_meta)) = (entry.metadata(), dst.metadata()) {
+                    let dst_up_to_date = src_meta.len() == dst_meta.len()
+                        && match (src_meta.modified(), dst_meta.modified()) {
+                            (Ok(src_time), Ok(dst_time)) => dst_time >= src_time,
+                            _ => false,
+                        };
+                    if dst_up_to_date {
+                        continue;
+                    }
+                }
+                std::fs::copy(&src, &dst)
+                    .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
+            }
+        }
+        Ok(())
+    }
+
+    // MSVC has no GCC-style inline asm on ARM64. Upstream's denormal
+    // disabler gates its x86 paths on `__clang__` (so MSVC x64 already
+    // takes the no-op fallback) but assumes every ARM compiler accepts
+    // `asm volatile`. Mirror the x86 compiler gate on the ARM arm so
+    // MSVC arm64 also falls back to the no-op DenormalDisabler. The
+    // patched gate preprocesses identically under GCC/clang, so this is
+    // applied on every platform.
+    fn patch_denormal_disabler(webrtc_source_dir: &Path) -> Result<()> {
+        const UNPATCHED: &str = "#if defined(WEBRTC_DENORMAL_DISABLER_X86_SUPPORTED) || \\\n    defined(WEBRTC_ARCH_ARM_FAMILY)\n";
+        const PATCHED: &str = "#if defined(WEBRTC_DENORMAL_DISABLER_X86_SUPPORTED) || (defined(WEBRTC_ARCH_ARM_FAMILY) && (defined(__GNUC__) || defined(__clang__)))\n";
+
+        let path = webrtc_source_dir
+            .join("webrtc")
+            .join("system_wrappers")
+            .join("source")
+            .join("denormal_disabler.cc");
+        let source = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if source.contains(PATCHED) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            source.contains(UNPATCHED),
+            "did not find the denormal disabler support gate to patch in {}",
+            path.display()
+        );
+        std::fs::write(&path, source.replacen(UNPATCHED, PATCHED, 1))
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
     fn webrtc_source_dir() -> PathBuf {
         out_dir().join("webrtc-audio-processing")
     }
 
     fn webrtc_build_dir() -> PathBuf {
+        // Windows MAX_PATH (260 chars) is easily exceeded because cl.exe
+        // concatenates CWD + relative source path BEFORE normalizing ".."
+        // components. Use the shortest possible build path (C:\w = 3 chars)
+        // to maximize headroom. Abseil has filenames up to 43 chars
+        // (hashtablez_sampler_force_weak_definition.cc).
+        // Falls back to the out_dir-based path if the short path can't be created.
+        if cfg!(target_os = "windows") {
+            let short = PathBuf::from("C:\\w");
+            match std::fs::create_dir_all(&short) {
+                Ok(()) => return short,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Could not create short build path {}: {e}",
+                        short.display()
+                    );
+                    eprintln!("Falling back to out_dir (may hit MAX_PATH issues)");
+                },
+            }
+        }
         out_dir().join("webrtc-audio-processing-build")
     }
 
@@ -352,7 +523,7 @@ impl ParseCallbacks for CustomDeriveCallbacks {
 
 fn main() -> Result<()> {
     webrtc::build_if_necessary()?;
-    let (include_dirs, lib_dirs) = webrtc::get_build_paths()?;
+    let (include_dirs, lib_dirs, has_system_abseil) = webrtc::get_build_paths()?;
 
     // Prefix defined symbols in the webrtc library (bundled builds only)
     // Returns the list of renamed symbols to update wrapper references later
@@ -396,19 +567,25 @@ fn main() -> Result<()> {
     // linkers (like when passing -Wl,--as-needed) may discard the c++ library (automatically
     // added by cc) from the linking list, resulting in build failure.
     // The linking order should respect the dependency graph, i.e. wrapper -> webrtc-2.
-    cc_build
-        .cpp(true)
-        .file("src/wrapper.cpp")
-        .includes(&include_dirs)
-        .flag("-std=c++17")
-        .flag("-Wno-unused-parameter")
-        .out_dir(out_dir());
+    cc_build.cpp(true).file("src/wrapper.cpp").includes(&include_dirs);
+
+    if cfg!(target_os = "windows") {
+        cc_build
+            .flag("/std:c++20")
+            .flag("/EHsc")
+            .flag("/W3")
+            .define("WEBRTC_WIN", None)
+            .define("WIN32_LEAN_AND_MEAN", None)
+            .define("NOMINMAX", None);
+    } else {
+        cc_build.flag("-std=c++17").flag("-Wno-unused-parameter");
+    }
 
     // Inform wrapper code that headers for internal classes (ResidualEchoDetector) are available.
     #[cfg(feature = "bundled")]
     cc_build.define("WEBRTC_HAS_INTERNAL_HEADERS", None);
 
-    cc_build.compile("webrtc_audio_processing_wrapper");
+    cc_build.out_dir(out_dir()).compile("webrtc_audio_processing_wrapper");
 
     // The the cc and bindgen commands emit `cargo:rerun-if-env-changed=...`, and these deactivate
     // the default behavior to rerun if _any_ source file changes. So state these explicitly.
@@ -417,16 +594,29 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/wrapper.cpp");
 
     // Prefix the wrapper library's references to webrtc symbols to match the renamed webrtc library.
-    let wrapper_lib = out_dir().join("libwebrtc_audio_processing_wrapper.a");
+    let wrapper_lib = if cfg!(target_os = "windows") {
+        out_dir().join("webrtc_audio_processing_wrapper.lib")
+    } else {
+        out_dir().join("libwebrtc_audio_processing_wrapper.a")
+    };
     if wrapper_lib.exists() {
         prefix_archive_symbols(&wrapper_lib, &renamed_symbols, SYMBOL_PREFIX)?;
     }
 
     if cfg!(feature = "bundled") {
         println!("cargo:rustc-link-lib=static={LIB_NAME}");
-        println!("cargo:rustc-link-lib=absl_strings");
+        // Only link abseil separately when using system-installed abseil.
+        // When abseil is built as a meson subproject, its objects are statically
+        // linked into the webrtc-audio-processing library.
+        if has_system_abseil {
+            println!("cargo:rustc-link-lib=absl_strings");
+        }
     } else {
         println!("cargo:rustc-link-lib=dylib={LIB_NAME}");
+    }
+
+    if cfg!(target_os = "windows") {
+        println!("cargo:rustc-link-lib=winmm");
     }
 
     let binding_file = out_dir().join("bindings.rs");

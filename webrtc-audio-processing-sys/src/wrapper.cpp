@@ -66,9 +66,10 @@ class EchoCanceller3Factory : public webrtc::EchoControlFactory {
 
 }  // namespace
 
-webrtc::StreamConfig create_stream_config(int sample_rate_hz,
-                                          size_t num_channels) {
-  return webrtc::StreamConfig(sample_rate_hz, num_channels);
+void create_stream_config(int sample_rate_hz,
+                          size_t num_channels,
+                          webrtc::StreamConfig* out) {
+  *out = webrtc::StreamConfig(sample_rate_hz, num_channels);
 }
 
 struct AudioProcessing {

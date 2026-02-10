@@ -14,11 +14,14 @@ use std::convert::TryInto;
 impl StreamConfig {
     /// Construct new [`Self`], safe convenience wrapper.
     pub fn new(sample_rate_hz: u32, num_channels: usize) -> StreamConfig {
+        let mut config = std::mem::MaybeUninit::<StreamConfig>::uninit();
         unsafe {
             create_stream_config(
                 sample_rate_hz.try_into().expect("sample rate fits i32"),
                 num_channels,
-            )
+                config.as_mut_ptr(),
+            );
+            config.assume_init()
         }
     }
 }
@@ -136,7 +139,9 @@ mod tests {
             let config = config_with_all_enabled();
             set_config(ap, &config);
 
-            let stream_config = create_stream_config(SAMPLE_RATE_HZ, 1);
+            let mut stream_config_out = std::mem::MaybeUninit::<StreamConfig>::uninit();
+            create_stream_config(SAMPLE_RATE_HZ, 1, stream_config_out.as_mut_ptr());
+            let stream_config = stream_config_out.assume_init();
             let num_samples = stream_config.num_frames_; // frames in WebRTC == our samples
             let mut frame = vec![vec![0f32; num_samples]; 1];
             let frame_ptr = frame.iter_mut().map(|v| v.as_mut_ptr()).collect::<Vec<*mut f32>>();
@@ -182,7 +187,9 @@ mod tests {
             let config = config_with_all_enabled();
             set_config(ap, &config);
 
-            let stream_config = create_stream_config(SAMPLE_RATE_HZ, 1);
+            let mut stream_config_out = std::mem::MaybeUninit::<StreamConfig>::uninit();
+            create_stream_config(SAMPLE_RATE_HZ, 1, stream_config_out.as_mut_ptr());
+            let stream_config = stream_config_out.assume_init();
             let num_samples = stream_config.num_frames_; // frames in WebRTC == our samples
             let mut frame = vec![vec![0f32; num_samples]; 1];
             let frame_ptr = frame.iter_mut().map(|v| v.as_mut_ptr()).collect::<Vec<*mut f32>>();

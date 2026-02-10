@@ -42,10 +42,15 @@ struct Stats {
   OptionalInt delay_ms;
 };
 
-// Creates the `StreamConfig` struct by calling the C++ constructor
-// (which bindgen fails to generate bindings for, likely because it is inline).
-webrtc::StreamConfig create_stream_config(int sample_rate_hz,
-                                          size_t num_channels);
+// Initializes `out` with the `StreamConfig` C++ constructor (which bindgen
+// fails to generate bindings for, likely because it is inline). Uses an out
+// parameter instead of returning by value: on arm64 Windows, MSVC and clang
+// (which bindgen uses to read this header) disagree on the return convention
+// for small classes with user-declared constructors, so a by-value return
+// reaches the caller as garbage.
+void create_stream_config(int sample_rate_hz,
+                          size_t num_channels,
+                          webrtc::StreamConfig* out);
 
 // Creates a new instance of AudioProcessing.
 // Takes a mutable pointer to the AEC3 config, as it internally calls
